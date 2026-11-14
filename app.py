@@ -1,13 +1,20 @@
+import io
 import streamlit as st
+from rag import extract_pages, chunk_pages
 
 st.set_page_config(page_title="PDF Chatbot")
 st.title("PDF Chatbot")
 
-# Chat history survives reruns via session_state
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Sidebar: upload and controls
+
+@st.cache_data(show_spinner="Reading PDF...")
+def process(pdf_bytes, chunk_size, chunk_overlap):
+    pages = extract_pages(io.BytesIO(pdf_bytes))
+    return pages, chunk_pages(pages, chunk_size, chunk_overlap)
+
+
 with st.sidebar:
     st.header("Settings")
     pdf = st.file_uploader("Upload a PDF", type="pdf")
@@ -18,15 +25,23 @@ with st.sidebar:
     if st.button("Clear chat"):
         st.session_state.messages = []
         st.rerun()
-    if pdf:
-        st.success(f"Loaded: {pdf.name}")
 
-# Show past messages
+chunks = []
+if pdf:
+    pages, chunks = process(pdf.getvalue(), chunk_size, chunk_overlap)
+    if not pages:
+        st.error("No text found. This may be a scanned PDF (images only).")
+    else:
+        st.sidebar.success(f"{pdf.name}: {len(pages)} pages, {len(chunks)} chunks")
+        with st.expander("Preview chunks"):
+            for c in chunks[:5]:
+                st.caption(f"Page {c['page']}")
+                st.text(c["text"])
+
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# New question
 if question := st.chat_input("Ask something about your PDF"):
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
