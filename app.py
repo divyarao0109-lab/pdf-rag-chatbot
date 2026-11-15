@@ -1,6 +1,6 @@
 import io
 import streamlit as st
-from rag import extract_pages, chunk_pages
+from rag import extract_pages, chunk_pages, embed_chunks, retrieve
 
 st.set_page_config(page_title="PDF Chatbot")
 st.title("PDF Chatbot")
@@ -9,10 +9,18 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 
-@st.cache_data(show_spinner="Reading PDF...")
+@st.cache_data(show_spinner="Reading and embedding the PDF...")
 def process(pdf_bytes, chunk_size, chunk_overlap):
     pages = extract_pages(io.BytesIO(pdf_bytes))
-    return pages, chunk_pages(pages, chunk_size, chunk_overlap)
+    chunks = chunk_pages(pages, chunk_size, chunk_overlap)
+    emb = embed_chunks(chunks) if chunks else None
+    return pages, chunks, emb
+
+
+def show_hits(hits):
+    for h in hits:
+        with st.expander(f"Page {h['page']} | similarity {h['score']:.2f}"):
+            st.text(h["text"])
 
 
 with st.sidebar:
@@ -26,28 +34,33 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-chunks = []
+pages, chunks, emb = [], [], None
 if pdf:
-    pages, chunks = process(pdf.getvalue(), chunk_size, chunk_overlap)
+    pages, chunks, emb = process(pdf.getvalue(), chunk_size, chunk_overlap)
     if not pages:
         st.error("No text found. This may be a scanned PDF (images only).")
     else:
         st.sidebar.success(f"{pdf.name}: {len(pages)} pages, {len(chunks)} chunks")
-        with st.expander("Preview chunks"):
-            for c in chunks[:5]:
-                st.caption(f"Page {c['page']}")
-                st.text(c["text"])
 
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
+        show_hits(m.get("hits", []))
 
 if question := st.chat_input("Ask something about your PDF"):
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    answer = "Placeholder: the RAG answer will appear here."
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+    if not chunks:
+        answer, hits = "Please upload a PDF first.", []
+    else:
+        hits = retrieve(question, chunks, emb, top_k)
+        answer = f"Top {len(hits)} matching sections (the LLM answer comes in Phase 7):"
+
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer, "hits": hits}
+    )
     with st.chat_message("assistant"):
         st.markdown(answer)
+        show_hits(hits)

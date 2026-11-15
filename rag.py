@@ -1,5 +1,7 @@
 import re
 from pypdf import PdfReader
+import numpy as np
+from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -27,3 +29,26 @@ def chunk_pages(pages, chunk_size=1000, chunk_overlap=200):
         for piece in splitter.split_text(p["text"]):
             chunks.append({"text": piece, "page": p["page"]})
     return chunks
+
+    
+_MODEL = None
+
+
+def get_model(name="all-MiniLM-L6-v2"):
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = SentenceTransformer(name)
+    return _MODEL
+
+
+def embed_chunks(chunks):
+    texts = [c["text"] for c in chunks]
+    return get_model().encode(texts, normalize_embeddings=True)
+
+
+def retrieve(question, chunks, chunk_emb, k=4):
+    """Return the k chunks most similar to the question, with scores."""
+    q = get_model().encode([question], normalize_embeddings=True)[0]
+    scores = chunk_emb @ q
+    top = np.argsort(scores)[::-1][:k]
+    return [{**chunks[i], "score": float(scores[i])} for i in top]
