@@ -1,6 +1,9 @@
 import io
 import streamlit as st
-from rag import extract_pages, chunk_pages, embed_chunks, retrieve
+from rag import (
+    extract_pages, chunk_pages, embed_chunks, retrieve,
+    stream_answer, spread_chunks,
+)
 
 st.set_page_config(page_title="PDF Chatbot")
 st.title("PDF Chatbot")
@@ -30,6 +33,7 @@ with st.sidebar:
     chunk_overlap = st.slider("Chunk overlap", 0, 500, 200, 50)
     top_k = st.slider("Top-k chunks", 1, 10, 4)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+    min_score = st.slider("Min similarity", 0.0, 0.8, 0.30, 0.05)
     if st.button("Clear chat"):
         st.session_state.messages = []
         st.rerun()
@@ -52,15 +56,23 @@ if question := st.chat_input("Ask something about your PDF"):
     with st.chat_message("user"):
         st.markdown(question)
 
-    if not chunks:
-        answer, hits = "Please upload a PDF first.", []
-    else:
-        hits = retrieve(question, chunks, emb, top_k)
-        answer = f"Top {len(hits)} matching sections (the LLM answer comes in Phase 7):"
+    with st.chat_message("assistant"):
+        if not chunks:
+            answer, hits = "Please upload a PDF first.", []
+            st.markdown(answer)
+        else:
+            if "summar" in question.lower():
+                hits = spread_chunks(chunks)
+            else:
+                hits = retrieve(question, chunks, emb, top_k)
+
+            if hits[0]["score"] < min_score:
+                answer = "I could not find this in the document."
+                st.markdown(answer)
+            else:
+                answer = st.write_stream(stream_answer(question, hits, temperature))
+            show_hits(hits)
 
     st.session_state.messages.append(
         {"role": "assistant", "content": answer, "hits": hits}
     )
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-        show_hits(hits)

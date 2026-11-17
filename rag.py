@@ -1,8 +1,14 @@
 import re
-from pypdf import PdfReader
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import ollama
+from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# --- Embedding settings -------------------------------------------------
+EMBEDDING_BACKEND = "ollama"            # "ollama" or "sbert"
+OLLAMA_EMBED_MODEL = "nomic-embed-text"
+SBERT_MODEL = "all-MiniLM-L6-v2"
+_SBERT = None
 
 
 def extract_pages(file):
@@ -30,25 +36,65 @@ def chunk_pages(pages, chunk_size=1000, chunk_overlap=200):
             chunks.append({"text": piece, "page": p["page"]})
     return chunks
 
-    
-_MODEL = None
 
+def embed_texts(texts, kind="document"):
+    """Return a (len(texts), dim) array of unit-length embeddings."""
+    global _SBERT
+    if EMBEDDING_BACKEND == "sbert":
+        if _SBERT is None:
+            from sentence_transformers import SentenceTransformer
+            _SBERT = SentenceTransformer(SBERT_MODEL)
+        return _SBERT.encode(texts, normalize_embeddings=True)
 
-def get_model(name="all-MiniLM-L6-v2"):
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = SentenceTransformer(name)
-    return _MODEL
+    # nomic-embed-text works best with these task prefixes
+    prefix = "search_document: " if kind == "document" else "search_query: "
+    resp = ollama.embed(model=OLLAMA_EMBED_MODEL, input=[prefix + t for t in texts])
+    arr = np.array(resp["embeddings"], dtype="float32")
+    return arr / np.linalg.norm(arr, axis=1, keepdims=True)
 
 
 def embed_chunks(chunks):
-    texts = [c["text"] for c in chunks]
-    return get_model().encode(texts, normalize_embeddings=True)
+    return embed_texts([c["text"] for c in chunks], kind="document")
 
 
 def retrieve(question, chunks, chunk_emb, k=4):
     """Return the k chunks most similar to the question, with scores."""
-    q = get_model().encode([question], normalize_embeddings=True)[0]
+    q = embed_texts([question], kind="query")[0]
     scores = chunk_emb @ q
     top = np.argsort(scores)[::-1][:k]
     return [{**chunks[i], "score": float(scores[i])} for i in top]
+
+
+SYSTEM_PROMPT = (
+    "You are an assistant that answers questions about a PDF document. "
+    "Use ONLY the context provided. "
+    "If the answer is not in the context, reply exactly: "
+    "'I could not find this in the document.' "
+    "Cite the page number(s) you used, like (Page 3)."
+)
+
+
+def build_prompt(question, hits):
+    context = "\n\n".join(f"[Page {h['page']}]\n{h['text']}" for h in hits)
+    return f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+
+
+def stream_answer(question, hits, temperature=0.2, model="llama3.2"):
+    """Yield the answer piece by piece so Streamlit can show it as it is written."""
+    stream = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_prompt(question, hits)},
+        ],
+        options={"temperature": temperature, "num_ctx": 4096},
+        stream=True,
+    )
+    for part in stream:
+        yield part["message"]["content"]
+
+
+def spread_chunks(chunks, n=8):
+    """For 'summarize' questions: take chunks spread evenly across the document."""
+    step = max(1, len(chunks) // n)
+    return [{**c, "score": 1.0} for c in chunks[::step][:n]]
