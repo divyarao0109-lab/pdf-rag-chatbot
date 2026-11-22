@@ -1,0 +1,6 @@
+streamlit
+ollama
+numpy
+pypdf
+langchain-text-splitters
+scikit-learn
