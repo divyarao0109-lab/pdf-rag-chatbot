@@ -28,6 +28,9 @@ sbert_model = "all-MiniLM-L6-v2"
 llm_model = "llama3.1"  # Run "ollama pull llama3.1" once before using it
 random_state = 42  # Seed to get the same clusters every time
 ollama_hint = "Could not reach the language model. Is Ollama running?"
+pdf_hint = "Could not read the PDF or create its embeddings. Is Ollama running?"
+history_turns = 3  # Number of earlier question-answer pairs sent to the model
+history_chars = 1200  # Longest part of an earlier answer which is sent to the model
 sbert_embedder = None  # Loaded only when the sbert backend is used
 
 
@@ -198,6 +201,8 @@ def get_cluster_chunks(chunks, chunk_embeddings, n_clusters = 10, num_closest = 
 qa_system = (
     "You are an assistant that answers questions about a PDF document. "
     "Use ONLY the context provided. "
+    "The earlier messages of the chat only show what the question refers to; "
+    "every fact in your answer must come from the context of the latest question. "
     "If the answer is not in the context, reply exactly: "
     "'I could not find this in the document.' "
     "Cite the page number(s) you used, like (Page 3)."
@@ -217,6 +222,12 @@ greeting_words = (
     "hello", "hi", "hii", "hey", "namaste", "good morning", "good afternoon",
     "good evening", "how are you", "thanks", "thank you", "bye", "goodbye",
 )
+
+# Words which show that a short question refers to the earlier conversation, like "explain that more"
+followup_words = {
+    "it", "its", "that", "this", "they", "them", "those", "these", "above", "earlier",
+    "previous", "first", "second", "third", "last", "more", "another", "elaborate",
+}
 
 
 # Checking whether the question asks for a summary of the whole document
@@ -255,6 +266,45 @@ def get_greeting_reply(question, has_pdf):
     return "Hello! I'm your PDF assistant. Upload a PDF in the sidebar, then ask me questions about it or ask for a summary."
 
 
+# Conversation memory
+
+# Returning the last few question-answer pairs of the chat, so that a follow-up question can be understood
+# Greetings (no hits) and the failed or "not found" answers are of no use as history, so they are left out
+
+def get_history(messages, max_turns = 3, max_chars = 1200):
+
+    earlier = messages[:-1]  # The last message is the question which is being answered right now
+    history = []
+
+    for i in range(len(earlier) - 1):
+        question, answer = earlier[i], earlier[i + 1]
+
+        if question["role"] == "user" and answer["role"] == "assistant":
+            if answer.get("hits") and not answer["content"].startswith(("I could not find", ollama_hint)):
+                history.append((question["content"], answer["content"][:max_chars]))
+
+    return history[-max_turns:]
+
+
+# Checking whether a short question refers to the earlier conversation, like "can you explain that more?"
+
+def is_followup(question):
+
+    words = re.findall(r"[a-z']+", question.lower())
+    return len(words) <= 10 and any(w in followup_words for w in words)
+
+
+# Creating the text which is searched in the PDF
+# A follow-up has no topic of its own, so it is searched together with the previous question
+
+def get_search_text(question, history):
+
+    if history and is_followup(question) and not is_summary_request(history[-1][0]):
+        return history[-1][0] + " " + question
+
+    return question
+
+
 # Joining the chunks and the question into one prompt
 
 def build_prompt(question, hits):
@@ -265,14 +315,18 @@ def build_prompt(question, hits):
 
 # Answering the question, yielding the answer piece by piece so that Streamlit can show it as it is written
 
-def stream_answer(question, hits, temperature = 0.2, model = None):
+def stream_answer(question, hits, temperature = 0.2, model = None, history = None):
+
+    # The earlier question-answer pairs come first, then the current question with its context
+    messages = [{"role": "system", "content": qa_system}]
+    for past_question, past_answer in history or []:
+        messages.append({"role": "user", "content": past_question})
+        messages.append({"role": "assistant", "content": past_answer})
+    messages.append({"role": "user", "content": build_prompt(question, hits)})
 
     stream = ollama.chat(
         model = model or llm_model,
-        messages = [
-            {"role": "system", "content": qa_system},
-            {"role": "user", "content": build_prompt(question, hits)},
-        ],
+        messages = messages,
         options = {"temperature": temperature, "num_ctx": 8192},
         stream = True,
     )
@@ -359,7 +413,12 @@ def main():
         with st.expander("Retrieval"):
             search_mode = st.selectbox("Method", ["Similarity", "MMR"])
             top_k = st.slider("Top-k chunks", 1, 10, 6)
-            min_score = st.slider("Min similarity", 0.0, 0.8, 0.30, 0.05)
+            min_score = st.slider(
+                "Min similarity", 0.0, 0.8, 0.30, 0.05,
+                help = "If the best chunk scores below this, the bot says it could not find the answer. "
+                       "To tune it, ask a question that is not in the PDF, read its similarity in Citations, "
+                       "and set this slightly above that score.",
+            )
 
         with st.expander("Summary (k-means)"):
             n_clusters = st.slider("Clusters", 3, 20, 10)
@@ -381,17 +440,20 @@ def main():
     # Reading the PDF, creating the chunks and their embeddings
     pages, chunks, chunk_embeddings = [], [], None
     if pdf:
-        pages, chunks, chunk_embeddings = process(pdf.getvalue(), chunk_size, chunk_overlap)
-
-        if not pages:
-            st.error("No text found. This may be a scanned PDF (images only).")
+        try:
+            pages, chunks, chunk_embeddings = process(pdf.getvalue(), chunk_size, chunk_overlap)
+        except Exception as e:
+            st.error(f"{pdf_hint} ({e})")  # pages and chunks stay empty, so the chat asks for a PDF
         else:
-            with stats.container():
-                c1, c2 = st.columns(2)
-                c1.metric("Pages", len(pages))
-                c2.metric("Chunks", len(chunks))
+            if not pages:
+                st.error("No text found. This may be a scanned PDF (images only).")
+            else:
+                with stats.container():
+                    c1, c2 = st.columns(2)
+                    c1.metric("Pages", len(pages))
+                    c2.metric("Chunks", len(chunks))
 
-    if not chunks:
+    if not chunks and not pdf:
         st.info("Upload a PDF in the sidebar to start chatting.")
 
     # Displaying the earlier messages of the conversation
@@ -432,20 +494,30 @@ def main():
 
             else:
                 # Answer to the question using the most similar chunks
-                if search_mode == "MMR":
-                    hits = retrieve_mmr(question, chunks, chunk_embeddings, top_k)
-                else:
-                    hits = retrieve(question, chunks, chunk_embeddings, top_k)
+                # The earlier turns of the chat let the bot understand a follow-up question
+                history = get_history(st.session_state.messages, history_turns, history_chars)
+                search_text = get_search_text(question, history)
 
-                if hits[0]["score"] < min_score:
-                    answer = "I could not find this in the document."
-                    st.markdown(answer)
-                else:
-                    try:
-                        answer = st.write_stream(stream_answer(question, hits, temperature))
-                    except Exception as e:
-                        answer = f"{ollama_hint} ({e})"
-                        st.error(answer)
+                try:
+                    if search_mode == "MMR":
+                        hits = retrieve_mmr(search_text, chunks, chunk_embeddings, top_k)
+                    else:
+                        hits = retrieve(search_text, chunks, chunk_embeddings, top_k)
+                except Exception as e:
+                    hits = []
+                    answer = f"{ollama_hint} ({e})"
+                    st.error(answer)
+
+                if hits:  # The search worked, otherwise the error is already shown
+                    if hits[0]["score"] < min_score:
+                        answer = "I could not find this in the document."
+                        st.markdown(answer)
+                    else:
+                        try:
+                            answer = st.write_stream(stream_answer(question, hits, temperature, history = history))
+                        except Exception as e:
+                            answer = f"{ollama_hint} ({e})"
+                            st.error(answer)
                 show_hits(hits, show_citations)
 
         st.session_state.messages.append(
